@@ -1,0 +1,843 @@
+// PRENDE RIFAS — Modelo de datos v2.2 (plan-tecnico-v2.md, especificación congelada)
+// Subfase S1. Reescribe el schema v1: 7 roles, 11 estados de rifa, reservas,
+// pedidos independientes, ledger append-only, sorteo commit-reveal,
+// 2FA, sesiones revocables, recuperación admin, fraude, notificaciones,
+// soporte, bases versionadas, monitoreo (JobRun), control de cambios,
+// multi-país / multi-pasarela (Country, PaymentProvider, CountryPaymentConfig).
+//
+// Desarrollo: SQLite. Producción: PostgreSQL — cambiar el provider a
+// "postgresql" y DATABASE_URL a la URL de Postgres; el resto del schema
+// es compatible con ambos motores (sin funciones específicas de SQLite).
+// Dinero SIEMPRE en enteros (unidades mayores de la moneda). Nunca floats.
+// LedgerEntry es append-only: nunca se actualiza ni se borra (no hay
+// funciones de update/delete para él en src/lib/ledger.ts).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+  // Prisma 7: la URL vive en prisma.config.ts, no aquí.
+}
+
+// ---------------------------------------------------------------- enums
+enum Role {
+  SUPERADMIN
+  ADMIN_RIFAS
+  FINANZAS
+  AUDITOR
+  MARKETING
+  AFILIADO
+  CLIENTE
+}
+
+enum CountryStatus {
+  BORRADOR
+  CONFIGURACION
+  REVISION
+  ACTIVO
+}
+
+// Clasificación A/B/C del plan §2.9: A = activable por configuración,
+// B = necesita nueva integración, C = pendiente de revisión legal/comercial.
+enum CountryClassification {
+  A
+  B
+  C
+}
+
+enum ProviderStatus {
+  NO_OPERATIVO
+  SANDBOX_VERIFICADO
+  OPERATIVO
+}
+
+enum RaffleStatus {
+  BORRADOR
+  PENDIENTE_APROBACION
+  PROGRAMADA
+  ACTIVA
+  PAUSADA
+  AGOTADA
+  CERRADA
+  EN_SORTEO
+  GANADOR_PUBLICADO
+  FINALIZADA
+  CANCELADA
+}
+
+enum TicketStatus {
+  DISPONIBLE
+  RESERVADO
+  VENDIDO
+  ANULADO
+  BLOCKED // bloqueado por admin (block/unblock); no se vende mientras tanto
+}
+
+enum ReservationStatus {
+  ACTIVA
+  VENCIDA
+  CONFIRMADA
+  CANCELADA
+}
+
+enum OrderStatus {
+  PENDIENTE
+  CONFIRMADO
+  FALLIDO
+  EXPIRADO
+  REEMBOLSADO
+  DISPUTADO
+}
+
+enum PaymentStatus {
+  PENDIENTE
+  APROBADO
+  FALLIDO
+  REEMBOLSADO
+  CONTRACARGO
+}
+
+enum PaymentMethodCode {
+  MANUAL_TRANSFER
+  PAYPAL
+  AZUL_CARD
+  CARDNET_CARD
+}
+
+enum LedgerEntryType {
+  VENTA
+  COMISION
+  REEMBOLSO
+  CONTRACARGO
+  COSTO
+  RETIRO
+  RESERVA
+  AJUSTE
+}
+
+enum CommissionStatus {
+  PENDING
+  RETAINED
+  AVAILABLE
+  PAID
+  ADJUSTED
+}
+
+enum WithdrawalStatus {
+  REQUESTED
+  APPROVED
+  PAID
+  REJECTED
+}
+
+enum WinnerCaseStatus {
+  PENDIENTE_CONTACTO
+  CONTACTADO
+  VERIFICACION
+  PREMIO_ACEPTADO
+  ENTREGA_COORDINADA
+  ENTREGADO
+  CASO_CERRADO
+}
+
+enum RiskStatus {
+  NORMAL
+  REVISION
+  RETENIDO
+  APROBADO
+  BLOQUEADO
+}
+
+enum SupportTicketType {
+  PAGO_SIN_BOLETO
+  CONSULTA_BOLETO
+  PAGO_RECHAZADO
+  PROBLEMA_COMPRA
+  DEVOLUCION
+  DUDA_GANADOR
+  OTRO
+}
+
+enum SupportTicketStatus {
+  ABIERTO
+  EN_REVISION
+  ESPERANDO_CLIENTE
+  RESUELTO
+  CERRADO
+}
+
+enum SupportPriority {
+  BAJA
+  MEDIA
+  ALTA
+  URGENTE
+}
+
+enum NotificationChannel {
+  EMAIL
+  WHATSAPP
+  SMS
+  WEB
+}
+
+enum NotificationStatus {
+  PENDIENTE
+  ENVIADO
+  ENTREGADO
+  FALLIDO
+}
+
+enum JobStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum RecoveryStatus {
+  PENDIENTE
+  APROBADO
+  RECHAZADO
+  COMPLETADO
+  EXPIRADO
+}
+
+enum ReconciliationStatus {
+  ABIERTO
+  EN_REVISION
+  RESUELTO
+}
+
+// ---------------------------------------------------------------- usuarios y seguridad
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         Role     @default(CLIENTE)
+  // Solo afiliados: código único de referido (ej. PRENDE1234)
+  referralCode String?  @unique
+  phone        String?
+  countryCode  String? // ISO alpha-2 del país del cliente (elegibilidad)
+  dateOfBirth  DateTime?
+  // Tras una recuperación de cuenta/2FA, el usuario debe re-enrolar 2FA
+  // antes de cualquier acción administrativa (regla 5 del plan).
+  mustReenroll2fa     Boolean   @default(false)
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+  lastLoginAt         DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  sessions          Session[]
+  twoFactor         TwoFactor?
+  recoveryRequests  RecoveryRequest[] @relation("RecoveryUser")
+  recoveryApprovals RecoveryRequest[] @relation("RecoveryApprover")
+  orders            Order[]
+  affiliateTickets  Ticket[]          @relation("TicketAffiliate")
+  affiliateOrders   Order[]           @relation("OrderAffiliate")
+  commissions       Commission[]      @relation("CommissionAffiliate")
+  withdrawals       Withdrawal[]      @relation("WithdrawalAffiliate")
+  withdrawalsApproved Withdrawal[]    @relation("WithdrawalApprover")
+  clicks            Click[]           @relation("ClickAffiliate")
+  draws             Draw[]            @relation("DrawnBy")
+  rafflesCreated    Raffle[]          @relation("RaffleCreator")
+  auditLogs         AuditLog[]        @relation("AuditActor")
+  changeLogsApproved ChangeLog[]      @relation("ChangeApprover")
+  fraudCasesReviewed FraudCase[]      @relation("FraudReviewer")
+  supportTickets    SupportTicket[]   @relation("SupportRequester")
+  supportTicketsOwned SupportTicket[] @relation("SupportOwner")
+  reconciliationResolved ReconciliationCase[] @relation("ReconciliationResolver")
+}
+
+// Sesión revocable: el JWT (cookie httpOnly pr_session) referencia a esta
+// fila por su jti (tokenHash = SHA256 del jti). Cerrar sesión o revocar
+// desde el admin invalida el token aunque el JWT no haya expirado.
+model Session {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique // SHA256 del jti del JWT
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// 2FA TOTP obligatorio para roles administrativos. El secreto se guarda
+// cifrado (AES-256-GCM, ver src/lib/totp.ts); los códigos de respaldo se
+// guardan hasheados con bcrypt (nunca en claro).
+model TwoFactor {
+  id               String   @id @default(cuid())
+  userId           String   @unique
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  secretEncrypted  String
+  enabled          Boolean  @default(false)
+  backupCodesHash  Json? // string[] de hashes bcrypt de códigos de respaldo
+  lastUsedAt       DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+// Recuperación de cuenta admin / 2FA (regla 5): la solicitud la aprueba
+// OTRO SUPERADMIN con 2FA; nunca hay auto-aprobación ni salto de 2FA.
+// Tras aprobarse, se genera un código de un solo uso (15 min, hasheado)
+// que se entrega por el canal registrado del usuario.
+model RecoveryRequest {
+  id                 String         @id @default(cuid())
+  userId             String
+  user               User           @relation("RecoveryUser", fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash          String // SHA256 del token de la solicitud (enlace admin)
+  status             RecoveryStatus @default(PENDIENTE)
+  reason             String?
+  requestedIp        String?
+  expiresAt          DateTime // expiración de la solicitud (1 h)
+  approvedById       String?
+  approvedBy         User?          @relation("RecoveryApprover", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedAt         DateTime?
+  resetCodeHash      String? // SHA256 del código de un solo uso (15 min)
+  resetCodeExpiresAt DateTime?
+  resetCodeAttempts  Int            @default(0)
+  completedAt        DateTime?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  @@index([userId, status])
+}
+
+// ---------------------------------------------------------------- internacionalización y pagos
+model Country {
+  id                  String                @id @default(cuid())
+  code                String                @unique // ISO 3166-1 alpha-2, ej. DO
+  name                String
+  flag                String? // emoji o URL de bandera
+  currencyCode        String // ISO 4217, ej. DOP
+  currencySymbol      String // ej. RD$
+  currencyFormat      String? // ej. "RD$ #,##0"
+  defaultLanguage     String                @default("es")
+  availableLanguages  Json                  @default("[\"es\"]")
+  timezone            String // IANA, ej. America/Santo_Domingo
+  dateFormat          String                @default("DD/MM/YYYY")
+  timeFormat          String?               @default("HH:mm")
+  allowedCountries    Json? // string[] de códigos ISO permitidos para participar
+  blockedCountries    Json? // string[] de códigos ISO bloqueados
+  legalConfig         Json? // requisitos legales / licencia / términos del país
+  notificationConfig  Json? // canales y plantillas por defecto
+  refundRules         Json? // reglas de reembolsos y contracargos
+  classification      CountryClassification @default(C)
+  status              CountryStatus         @default(BORRADOR)
+  legalVerified       Boolean               @default(false)
+  providerVerified    Boolean               @default(false)
+  createdAt           DateTime              @default(now())
+  updatedAt           DateTime              @updatedAt
+
+  raffles       Raffle[]
+  paymentConfigs CountryPaymentConfig[]
+}
+
+// Proveedor de pago preintegrado (registro de adaptadores, ver
+// src/lib/payments/registry.ts). Ninguno es OPERATIVO hasta verificar
+// integración real + autorización para rifas + conciliación (regla 6).
+// Las credenciales NUNCA se guardan aquí: credentialsRef es solo una
+// referencia segura (nombre de variable de entorno / Secure Vault).
+model PaymentProvider {
+  id                    String         @id @default(cuid())
+  code                  String         @unique // MANUAL_TRANSFER | PAYPAL | AZUL | CARDNET
+  name                  String
+  type                  String // MANUAL | GATEWAY
+  status                ProviderStatus @default(NO_OPERATIVO)
+  sandboxMode           Boolean        @default(true)
+  credentialsRef        String? // referencia segura (origen + claves presentes, nunca valores)
+  credentialsEncrypted  String? // credenciales del panel, cifradas AES-256-GCM (nunca se devuelven)
+  authorizedForRaffles  Boolean        @default(false)
+  lastSandboxTestAt     DateTime?
+  lastSandboxTestPassed Boolean?
+  verifiedAt            DateTime?
+  notes                 String?
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+
+  methods  PaymentMethod[]
+  configs  CountryPaymentConfig[]
+  payments Payment[]
+}
+
+model PaymentMethod {
+  id         String            @id @default(cuid())
+  code       PaymentMethodCode @unique
+  providerId String
+  provider   PaymentProvider   @relation(fields: [providerId], references: [id])
+  label      String
+  details    String            @default("") // texto libre: banco y cuenta, etc.
+  enabled    Boolean           @default(true)
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+
+  configs CountryPaymentConfig[]
+}
+
+model CountryPaymentConfig {
+  id           String          @id @default(cuid())
+  countryId    String
+  country      Country         @relation(fields: [countryId], references: [id], onDelete: Cascade)
+  providerId   String
+  provider     PaymentProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+  methodId     String
+  method       PaymentMethod   @relation(fields: [methodId], references: [id], onDelete: Cascade)
+  priority     Int             @default(1)
+  feeFixed     Int             @default(0) // entero, unidades mayores
+  feePercentBps Int            @default(0) // puntos básicos (100 = 1%)
+  limits       Json? // {min, max, ...} en enteros
+  enabled      Boolean         @default(false)
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  @@unique([countryId, providerId, methodId])
+}
+
+// Historial de configuraciones: cada cambio de país, método, proveedor o
+// credencial queda registrado (quién, cuándo, antes/después).
+model ConfigHistory {
+  id          String   @id @default(cuid())
+  entity      String // Country | PaymentProvider | PaymentMethod | CountryPaymentConfig | Setting
+  entityId    String
+  changedById String?
+  before      Json?
+  after       Json?
+  reason      String?
+  createdAt   DateTime @default(now())
+
+  @@index([entity, entityId])
+}
+
+// ---------------------------------------------------------------- rifas, bases y boletos
+model Raffle {
+  id                    String       @id @default(cuid())
+  title                 String
+  description           String
+  prize                 String
+  imageUrl              String?
+  countryId             String
+  country               Country      @relation(fields: [countryId], references: [id])
+  currency              String // moneda base = la del país (snapshot)
+  ticketPrice           Int // entero, unidades mayores (100 = RD$100)
+  totalTickets          Int
+  drawAt                DateTime
+  status                RaffleStatus @default(BORRADOR)
+  rules                 String       @default("")
+  termsVersionId        String? // versión vigente de las bases
+  licenseNumber         String? // licencia/registro (Hacienda / Pro Consumidor)
+  minTicketsToDraw      Int?
+  maxTicketsPerPurchase Int?
+  maxTicketsPerCustomer Int?
+  createdById           String?
+  createdBy             User?        @relation("RaffleCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt             DateTime     @default(now())
+  updatedAt             DateTime     @updatedAt
+
+  tickets           Ticket[]
+  orders            Order[]
+  reservations      Reservation[]
+  terms             RaffleTerms[]
+  termsAcceptances  TermsAcceptance[]
+  draw              Draw?
+  winnerCase        WinnerCase?
+  clicks            Click[]
+
+  @@index([countryId, status])
+}
+
+// Bases versionadas por rifa: cada comprador queda vinculado a la versión
+// que aceptó; los cambios posteriores quedan registrados con su versión.
+model RaffleTerms {
+  id          String   @id @default(cuid())
+  raffleId    String
+  raffle      Raffle   @relation(fields: [raffleId], references: [id], onDelete: Cascade)
+  version     Int
+  content     String
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  acceptances TermsAcceptance[]
+
+  @@unique([raffleId, version])
+}
+
+model TermsAcceptance {
+  id         String      @id @default(cuid())
+  raffleId   String
+  raffle     Raffle      @relation(fields: [raffleId], references: [id], onDelete: Cascade)
+  termsId    String
+  terms      RaffleTerms @relation(fields: [termsId], references: [id])
+  userId     String?
+  buyerEmail String
+  acceptedAt DateTime    @default(now())
+
+  @@unique([raffleId, termsId, buyerEmail])
+  @@index([buyerEmail])
+}
+
+model Ticket {
+  id            String       @id @default(cuid())
+  raffleId      String
+  raffle        Raffle       @relation(fields: [raffleId], references: [id], onDelete: Cascade)
+  number        Int // 1..totalTickets
+  code          String       @unique // Ej. PR-XXXXXX-000123
+  status        TicketStatus @default(DISPONIBLE)
+  orderId       String?
+  order         Order?       @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  reservationId String?
+  reservation   Reservation? @relation(fields: [reservationId], references: [id], onDelete: SetNull)
+  buyerName     String?
+  buyerEmail    String?
+  buyerPhone    String?
+  affiliateId   String?
+  affiliate     User?        @relation("TicketAffiliate", fields: [affiliateId], references: [id], onDelete: SetNull)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  commissions Commission[]
+  wonDraw     Draw?        @relation("DrawWinner")
+
+  @@unique([raffleId, number])
+  @@index([raffleId, status])
+  @@index([orderId])
+}
+
+// Reserva temporal (~10 min por defecto). Los números se guardan como
+// JSON (int[]) — determinista y compatible con SQLite y PostgreSQL.
+model Reservation {
+  id             String            @id @default(cuid())
+  raffleId       String
+  raffle         Raffle            @relation(fields: [raffleId], references: [id], onDelete: Cascade)
+  buyerEmail     String
+  userId         String?
+  numbers        Json // number[]
+  expiresAt      DateTime
+  idempotencyKey String?           @unique
+  status         ReservationStatus @default(ACTIVA)
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  tickets Ticket[]
+
+  @@index([raffleId, status])
+  @@index([expiresAt])
+}
+
+// Pedido independiente de boletos y pago (plan §2.11).
+model Order {
+  id               String            @id @default(cuid())
+  code             String            @unique // Ej. ORD-XXXXXXXX
+  raffleId         String
+  raffle           Raffle            @relation(fields: [raffleId], references: [id])
+  userId           String?
+  user             User?             @relation(fields: [userId], references: [id], onDelete: SetNull)
+  buyerName        String
+  buyerEmail       String
+  buyerPhone       String?
+  paymentMethodCode PaymentMethodCode
+  affiliateId      String?
+  affiliate        User?             @relation("OrderAffiliate", fields: [affiliateId], references: [id], onDelete: SetNull)
+  affiliateCode    String?
+  totalAmount      Int // entero, unidades mayores
+  currency         String
+  status           OrderStatus       @default(PENDIENTE)
+  idempotencyKey   String            @unique
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  tickets     Ticket[]
+  payments    Payment[]
+  commissions Commission[]
+
+  @@index([raffleId, status])
+  @@index([buyerEmail])
+}
+
+model Payment {
+  id           String            @id @default(cuid())
+  orderId      String
+  order        Order             @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  providerId   String?
+  provider     PaymentProvider?  @relation(fields: [providerId], references: [id], onDelete: SetNull)
+  providerCode String? // MANUAL_TRANSFER | PAYPAL | AZUL | CARDNET
+  providerRef  String? // referencia del proveedor (ej. id de transacción)
+  amount       Int // entero, unidades mayores
+  currency     String
+  methodCode   PaymentMethodCode
+  status       PaymentStatus     @default(PENDIENTE)
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  @@index([orderId])
+  @@index([providerCode, providerRef])
+}
+
+// ---------------------------------------------------------------- finanzas
+// Ledger inmutable (append-only): cada movimiento es una fila que NUNCA
+// se edita ni se borra. Los errores se corrigen con asientos
+// compensatorios (type AJUSTE) que referencian al asiento original.
+// Sin updatedAt a propósito: una fila de ledger no cambia jamás.
+model LedgerEntry {
+  id        String          @id @default(cuid())
+  type      LedgerEntryType
+  amount    Int // entero; positivo = entrada, negativo = salida/ajuste
+  currency  String
+  refType   String // Order | Commission | Withdrawal | Raffle | Payment ...
+  refId     String
+  metadata  Json?
+  createdAt DateTime        @default(now())
+
+  @@index([refType, refId])
+  @@index([type, createdAt])
+}
+
+model Commission {
+  id          String           @id @default(cuid())
+  affiliateId String
+  affiliate   User             @relation("CommissionAffiliate", fields: [affiliateId], references: [id], onDelete: Cascade)
+  orderId     String
+  order       Order            @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  ticketId    String?
+  ticket      Ticket?          @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+  amount      Int // 10% del precio del boleto, solo sobre ventas PAGADAS
+  currency    String           @default("DOP")
+  status      CommissionStatus @default(PENDING)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@unique([orderId, ticketId])
+  @@index([affiliateId, status])
+}
+
+model Withdrawal {
+  id           String           @id @default(cuid())
+  affiliateId  String
+  affiliate    User             @relation("WithdrawalAffiliate", fields: [affiliateId], references: [id], onDelete: Cascade)
+  amount       Int // entero, unidades mayores
+  currency     String           @default("DOP")
+  status       WithdrawalStatus @default(REQUESTED)
+  approvedById String?
+  approvedBy   User?            @relation("WithdrawalApprover", fields: [approvedById], references: [id], onDelete: SetNull)
+  receiptRef   String? // comprobante de pago
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@index([affiliateId, status])
+}
+
+// Clic de afiliado. clickedAt es la base de la ventana de atribución
+// (7 días, último clic válido).
+model Click {
+  id          String   @id @default(cuid())
+  affiliateId String
+  affiliate   User     @relation("ClickAffiliate", fields: [affiliateId], references: [id], onDelete: Cascade)
+  raffleId    String?
+  raffle      Raffle?  @relation(fields: [raffleId], references: [id], onDelete: SetNull)
+  code        String? // código de referido usado
+  clickedAt   DateTime @default(now())
+  ipAddress   String?
+  createdAt   DateTime @default(now())
+
+  @@index([affiliateId, clickedAt])
+}
+
+// ---------------------------------------------------------------- sorteo y ganador
+// Sorteo commit-reveal: commitment = SHA256(seed + ":" + hashElegibles),
+// publicado ANTES del sorteo; seed se revela DESPUÉS (nullable hasta el
+// reveal). eligibleSnapshot es la serialización determinista de la lista
+// congelada (JSON de números ordenados). Una rifa solo se sortea una vez
+// (raffleId único).
+model Draw {
+  id               String    @id @default(cuid())
+  raffleId         String    @unique
+  raffle           Raffle    @relation(fields: [raffleId], references: [id], onDelete: Cascade)
+  commitment       String // SHA256(seed + ":" + hashElegibles), publicado antes
+  seed             String? // secreta hasta el reveal; null antes de ejecutar
+  hashElegibles    String // SHA256 de eligibleSnapshot
+  eligibleSnapshot String // serialización determinista (JSON, números ordenados)
+  totalElegibles   Int
+  winningTicketId  String?   @unique
+  winningTicket    Ticket?   @relation("DrawWinner", fields: [winningTicketId], references: [id], onDelete: SetNull)
+  algorithm        String    @default("SHA256-CHAIN-v1")
+  executedAt       DateTime?
+  drawnById        String?
+  drawnBy          User?     @relation("DrawnBy", fields: [drawnById], references: [id], onDelete: SetNull)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+}
+
+// Gestión del ganador (7 estados). "Ganador publicado" es INDEPENDIENTE
+// de "premio entregado / caso cerrado" (aclaración 2 del plan).
+model WinnerCase {
+  id              String           @id @default(cuid())
+  raffleId        String           @unique
+  raffle          Raffle           @relation(fields: [raffleId], references: [id], onDelete: Cascade)
+  winningTicketId String?
+  status          WinnerCaseStatus @default(PENDIENTE_CONTACTO)
+  evidence        Json? // fotos, acta firmada, referencias de entrega
+  contactLog      Json? // [{at, channel, note}] — registro de contactos
+  notes           String?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+}
+
+// ---------------------------------------------------------------- operación
+model Notification {
+  id         String             @id @default(cuid())
+  event      String // pago_confirmado, sorteo_proximo, ...
+  channel    NotificationChannel
+  recipient  String // email o teléfono
+  status     NotificationStatus @default(PENDIENTE)
+  attempts   Int                @default(0)
+  payload    Json?
+  lastError  String?
+  sentAt     DateTime?
+  createdAt  DateTime           @default(now())
+  updatedAt  DateTime           @updatedAt
+
+  @@index([event, recipient, channel])
+}
+
+model SupportTicket {
+  id          String              @id @default(cuid())
+  number      String              @unique // Ej. TKT-000123
+  type        SupportTicketType
+  status      SupportTicketStatus @default(ABIERTO)
+  priority    SupportPriority     @default(MEDIA)
+  userId      String?
+  user        User?               @relation("SupportRequester", fields: [userId], references: [id], onDelete: SetNull)
+  buyerEmail  String? // email del reclamante (reclamos públicos sin cuenta)
+  orderId     String?
+  ownerId     String?
+  owner       User?               @relation("SupportOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  subject     String
+  description String
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+  resolvedAt  DateTime?
+
+  @@index([status, createdAt])
+}
+
+// Audit log inmutable: quién, cuándo, qué, antes/después.
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String?
+  actor     User?    @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+  action    String
+  entity    String
+  entityId  String?
+  before    Json?
+  after     Json?
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([entity, entityId])
+  @@index([actorId, createdAt])
+}
+
+// Control de cambios (§2.20): todo cambio sensible registra antes/después,
+// motivo y aprobación cuando corresponde.
+model ChangeLog {
+  id           String   @id @default(cuid())
+  actorId      String?
+  entity       String
+  entityId     String
+  field        String?
+  beforeValue  String?
+  afterValue   String?
+  reason       String?
+  approvedById String?
+  approvedBy   User?    @relation("ChangeApprover", fields: [approvedById], references: [id], onDelete: SetNull)
+  createdAt    DateTime @default(now())
+
+  @@index([entity, entityId])
+}
+
+model FraudCase {
+  id           String     @id @default(cuid())
+  rule         String // regla que disparó la marca
+  reason       String
+  status       RiskStatus @default(REVISION)
+  entityType   String // Order | User | Withdrawal ...
+  entityId     String
+  reviewedById String?
+  reviewedBy   User?      @relation("FraudReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  decision     String?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  resolvedAt   DateTime?
+
+  @@index([entityType, entityId])
+  @@index([status])
+}
+
+model WebhookEvent {
+  id          String    @id @default(cuid())
+  provider    String // PAYPAL | AZUL | CARDNET
+  eventId     String // id del evento en el proveedor
+  payload     Json
+  processedAt DateTime?
+  error       String?
+  createdAt   DateTime  @default(now())
+
+  @@unique([provider, eventId])
+}
+
+// Idempotencia de operaciones críticas (pedido, pago, webhook, emisión
+// de boletos, comisión). Repetir la misma clave + scope devuelve la
+// misma respuesta sin efectos duplicados.
+model IdempotencyKey {
+  id        String   @id @default(cuid())
+  key       String
+  scope     String // order | payment | webhook | tickets | commission ...
+  response  Json? // respuesta guardada para repetirla
+  createdAt DateTime @default(now())
+  expiresAt DateTime?
+
+  @@unique([key, scope])
+}
+
+// Jobs resistentes (regla 3): cada ejecución registra inicio/fin,
+// resultado y error; re-ejecutable sin duplicar efectos.
+model JobRun {
+  id         String    @id @default(cuid())
+  job        String
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  status     JobStatus @default(RUNNING)
+  result     Json?
+  error      String?
+
+  @@index([job, startedAt])
+}
+
+model ReconciliationCase {
+  id           String               @id @default(cuid())
+  provider     String
+  period       String? // ej. 2026-11-21
+  status       ReconciliationStatus @default(ABIERTO)
+  detail       Json? // qué falta, en qué lado, montos, fechas
+  amount       Int?
+  currency     String?
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+  resolvedAt   DateTime?
+  resolvedById String?
+  resolvedBy   User?                @relation("ReconciliationResolver", fields: [resolvedById], references: [id], onDelete: SetNull)
+
+  @@index([provider, status])
+}
+
+model Setting {
+  key       String   @id // Ej. COMMISSION_RATE (por ciento: "10" = 10%)
+  value     String
+  updatedAt DateTime @updatedAt
+}
